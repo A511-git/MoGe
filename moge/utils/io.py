@@ -39,6 +39,8 @@ def save_glb(
             )
         )
     elif vertex_colors is not None:
+        if np.issubdtype(vertex_colors.dtype, np.floating) and vertex_colors.max() <= 1.0:
+            vertex_colors = np.clip(vertex_colors * 255.0, 0, 255).astype(np.uint8)
         visual = trimesh.visual.ColorVisuals(
             vertex_colors=vertex_colors
         )
@@ -56,12 +58,15 @@ def save_ply(
     save_path: Union[str, os.PathLike], 
     vertices: np.ndarray, 
     faces: np.ndarray, 
-    vertex_colors: np.ndarray,
+    vertex_colors: Optional[np.ndarray] = None,
     vertex_normals: Optional[np.ndarray] = None,
 ):
     import trimesh
     import trimesh.visual
-    from PIL import Image
+
+    if vertex_colors is not None:
+        if np.issubdtype(vertex_colors.dtype, np.floating) and vertex_colors.max() <= 1.0:
+            vertex_colors = np.clip(vertex_colors * 255.0, 0, 255).astype(np.uint8)
 
     trimesh.Trimesh(
         vertices=vertices, 

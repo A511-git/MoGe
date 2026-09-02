@@ -234,8 +234,7 @@ def fit_ground_plane(
 
     # Subsample if too many points for speed
     if len(all_cand_pts) > 20000:
-        idx = np.random.choice(len(all_cand_pts), 20000, replace=False)
-        all_cand_pts = all_cand_pts[idx]
+        all_cand_pts = all_cand_pts[::max(1, len(all_cand_pts) // 20000)]
 
     # Robust median height
     z_vals = all_cand_pts[:, 2]
@@ -415,7 +414,7 @@ def build_panorama_mesh_multiview(
 
         uv = utils3d.np.uv_map((H, W))
         if view_has_normal:
-            faces_i, vert_i, colors_i, _, norm_i = utils3d.np.build_mesh_from_map(
+            faces_i, vert_i, colors_i, uvs_i, norm_i = utils3d.np.build_mesh_from_map(
                 points,
                 image.astype(np.float32) / 255.0,
                 uv,
@@ -424,7 +423,7 @@ def build_panorama_mesh_multiview(
                 tri=True
             )
         else:
-            faces_i, vert_i, colors_i, _ = utils3d.np.build_mesh_from_map(
+            faces_i, vert_i, colors_i, uvs_i = utils3d.np.build_mesh_from_map(
                 points,
                 image.astype(np.float32) / 255.0,
                 uv,
@@ -470,6 +469,8 @@ def build_panorama_mesh_multiview(
     all_faces = np.concatenate(faces_list, axis=0)
     all_colors = np.concatenate(colors_list, axis=0)
     all_normals = np.concatenate(normals_list, axis=0) if len(normals_list) > 0 else None
+    if all_normals is not None and len(all_normals) != len(all_vertices):
+        all_normals = None
 
     # OpenGL coordinate conventions:
     # world coordinate system: x right, y up, z backward.

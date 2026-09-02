@@ -140,13 +140,13 @@ def main(
             infer_kwargs = {
                 'fov_x': fov_x,
                 'resolution_level': resolution_level,
+                'use_fp16': use_fp16,
                 'apply_mask': False,
             }
             if num_tokens is not None:
                 infer_kwargs['num_tokens'] = num_tokens
             if model_version == 'v3':
                 infer_kwargs['refine_steps'] = refine_steps
-                infer_kwargs['use_fp16'] = use_fp16
 
             output = model.infer(image_tensor, **infer_kwargs)
             distance_map, mask = output['points'].norm(dim=-1).cpu().numpy(), output['mask'].cpu().numpy()
@@ -173,8 +173,8 @@ def main(
                 # Distance (raw float32 and visualization)
                 cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
                 cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                # Point map
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_points.exr'), splitted_points_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                # Point map (swapped to BGR for OpenCV EXR writer)
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_points.exr'), cv2.cvtColor(splitted_points_maps[i], cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
                 # Normal (if available)
                 if len(splitted_normal_maps) > i:
                     cv2.imwrite(str(splitted_save_path / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
@@ -196,18 +196,29 @@ def main(
             with open(splitted_save_path / 'cameras.json', 'w') as f:
                 json.dump({'views': cameras_meta}, f, indent=2)
 
-        # Build 3D mesh directly in world space
+        # Fit ground plane if planar_floor is enabled
         ground_plane = None
+        if planar_floor and len(splitted_normal_maps) > 0:
+            ground_plane = fit_ground_plane(
+                splitted_points_maps,
+                splitted_normal_maps,
+                splitted_masks,
+                splitted_extrinsics
+            )
+
+        # Build 3D mesh directly in world space
+        vertices, faces, vertex_colors, vertex_normals = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None
         if save_glb_ or save_ply_ or show:
             print('Building 3D multi-view mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 3D mesh')
-            vertices, faces, vertex_colors, vertex_normals, ground_plane = build_panorama_mesh_multiview(
+            vertices, faces, vertex_colors, vertex_normals, _ = build_panorama_mesh_multiview(
                 splitted_images,
                 splitted_points_maps,
                 splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
                 splitted_masks,
                 splitted_extrinsics,
                 threshold=threshold,
-                planar_floor=planar_floor
+                planar_floor=planar_floor,
+                ground_plane=ground_plane
             )
 
         # Merge 2D maps
@@ -237,25 +248,29 @@ def main(
         if save_maps_:
             cv2.imwrite(str(save_path / 'image.jpg'), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
-            cv2.imwrite(str(save_path / 'normal_vis.png'), cv2.cvtColor(colorize_normal(panorama_normal, mask=panorama_mask), cv2.COLOR_RGB2BGR))
+            if panorama_normal is not None:
+                cv2.imwrite(str(save_path / 'normal_vis.png'), cv2.cvtColor(colorize_normal(panorama_normal, mask=panorama_mask), cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(save_path / 'depth.exr'), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-            cv2.imwrite(str(save_path / 'points.exr'), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+            cv2.imwrite(str(save_path / 'points.exr'), cv2.cvtColor(points, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
             cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
 
-        if save_glb_:
-            save_glb(save_path / 'mesh.glb', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
+        if (save_glb_ or save_ply_ or show) and len(vertices) > 0:
+            if save_glb_:
+                save_glb(save_path / 'mesh.glb', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
 
-        if save_ply_:
-            save_ply(save_path / 'mesh.ply', vertices, faces, vertex_colors, vertex_normals)
+            if save_ply_:
+                save_ply(save_path / 'mesh.ply', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
 
-        if show:
-            trimesh.Trimesh(
-                vertices=vertices,
-                vertex_colors=vertex_colors,
-                vertex_normals=vertex_normals,
-                faces=faces, 
-                process=False
-            ).show()  
+            if show:
+                trimesh.Trimesh(
+                    vertices=vertices,
+                    vertex_colors=vertex_colors,
+                    vertex_normals=vertex_normals,
+                    faces=faces, 
+                    process=False
+                ).show()
+        elif (save_glb_ or save_ply_ or show) and len(vertices) == 0:
+            warnings.warn('Reconstructed mesh has 0 vertices; skipping mesh export.')
 
 
 if __name__ == '__main__':
