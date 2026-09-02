@@ -216,9 +216,9 @@ def fit_ground_plane(
         norm = splitted_normals[i]
         mask = splitted_masks[i] & (pts[..., 2] > 0)
 
-        # Rotate to world coordinates: P_world = P_cam @ R
-        pts_w = pts @ R
-        norm_w = norm @ R
+        # Rotate to world coordinates: R is world-to-camera, so inverse is R.T
+        pts_w = pts @ R.T
+        norm_w = norm @ R.T
 
         # Candidate floor: below camera (Z < -0.3) and normal pointing UP (norm_w[..., 2] > 0.80)
         is_floor_cand = mask & (pts_w[..., 2] < -0.3) & (norm_w[..., 2] > 0.80)
@@ -309,7 +309,7 @@ def merge_panorama_depth_raycast(
 
         if has_normals and normal_maps[i] is not None:
             sampled_norm_cam = cv2.remap(normal_maps[i], projected_pixels[..., 0], projected_pixels[..., 1], cv2.INTER_LINEAR)
-            sampled_norm_world = sampled_norm_cam @ R
+            sampled_norm_world = sampled_norm_cam @ R.T
             accum_normal += sampled_norm_world * weight[..., None]
 
     nonzero = accum_weight > 1e-6
@@ -377,8 +377,8 @@ def build_panorama_mesh_multiview(
         # Ground plane snapping
         if ground_plane is not None and view_has_normal:
             n_floor, d_floor = ground_plane
-            pts_w = points @ R
-            norm_w = normal @ R
+            pts_w = points @ R.T
+            norm_w = normal @ R.T
 
             dist_to_plane = np.abs(np.sum(pts_w * n_floor, axis=-1) + d_floor)
             is_floor = (pts_w[..., 2] < -0.3) & (norm_w[..., 2] > 0.75) & (dist_to_plane < 0.25)
@@ -390,8 +390,8 @@ def build_panorama_mesh_multiview(
             if np.any(valid_snap):
                 r_exact = -d_floor / np.minimum(denom, -0.05)
                 pts_w[valid_snap] = ray_w[valid_snap] * r_exact[valid_snap, None]
-                points[valid_snap] = pts_w[valid_snap] @ R.T
-                normal[valid_snap] = n_floor @ R.T
+                points[valid_snap] = pts_w[valid_snap] @ R
+                normal[valid_snap] = n_floor @ R
 
         depth = points[..., 2]
         mask_cleaned = mask & (depth > 0)
@@ -450,14 +450,14 @@ def build_panorama_mesh_multiview(
         if len(faces_i) == 0:
             continue
 
-        # Rotate camera coordinates to world coordinates: P_world = P_cam @ R
-        vert_world_i = vert_i @ R
+        # Rotate camera coordinates to world coordinates: R is world-to-camera, so inverse is R.T
+        vert_world_i = vert_i @ R.T
         vertices_list.append(vert_world_i)
         faces_list.append(faces_i + total_vertices)
         colors_list.append(colors_i)
 
         if norm_i is not None:
-            norm_world_i = norm_i @ R
+            norm_world_i = norm_i @ R.T
             normals_list.append(norm_world_i)
 
         total_vertices += len(vert_world_i)
@@ -503,8 +503,8 @@ def align_view_scales(
         if splitted_normals is None or splitted_normals[i] is None:
             continue
         R = splitted_extrinsics[i][:3, :3]
-        pts_w = splitted_points[i] @ R
-        norm_w = splitted_normals[i] @ R
+        pts_w = splitted_points[i] @ R.T
+        norm_w = splitted_normals[i] @ R.T
         mask = splitted_masks[i] & (splitted_points[i][..., 2] > 0)
         is_floor = mask & (pts_w[..., 2] < -0.3) & (norm_w[..., 2] > 0.80)
         if np.count_nonzero(is_floor) > 100:
