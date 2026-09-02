@@ -25,9 +25,8 @@ class Baseline(MGEBaselineInterface):
             default_pretrained_models = {
                 'v1': 'Ruicheng/moge-vitl',
                 'v2': 'Ruicheng/moge-2-vitl-normal',
+                'v3': 'Ruicheng/moge-3-vitl',
             }
-            if version == 'v3':
-                raise click.UsageError('--pretrained is required when --version is v3.')
             pretrained_model_name_or_path = default_pretrained_models[version]
         self.model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
         if version == 'v3' and refine_steps > 0 and not hasattr(self.model, 'refiner'):

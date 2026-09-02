@@ -312,8 +312,8 @@ Note that the panorama image must have spherical parameterization (e.g., environ
 # Infer panorama with MoGe-2
 moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 -o OUTPUT_FOLDER --maps --glb --ply
 
-# Infer panorama with MoGe-3 (using iterative refinement)
-moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v3 --pretrained PATH_TO_CKPT.pt --refine_steps 3 -o OUTPUT_FOLDER --maps --glb --ply
+# Infer panorama with MoGe-3 (automatically downloads Ruicheng/moge-3-vitl)
+moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v3 -o OUTPUT_FOLDER --maps --glb --ply
 
 # Export all individual splitted perspective views and multi-view cameras
 moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 --splitted -o OUTPUT_FOLDER
@@ -324,7 +324,7 @@ moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 --splitted -o OUTPU
 | Parameter | Type / Range | Default | Impact as Value Goes Up (↑) / Down (↓) |
 | :--- | :--- | :--- | :--- |
 | **`--version`** | `v1` \| `v2` \| `v3` | `v3` | Selects architecture. `v1`: baseline affine depth; `v2`: predicts sharp surface normals & metric scale; `v3`: adds iterative sparse 3D U-Net refinement. |
-| **`--pretrained`** | `str` (path / repo) | `None` | Pretrained weights. For `v1`/`v2`, auto-downloads from HuggingFace if `None`. For `v3`, requires a local path to the checkpoint `.pt`. |
+| **`--pretrained`** | `str` (path / repo) | `None` | Pretrained weights name or path. If `None`, automatically downloads default weights from HuggingFace (`Ruicheng/moge-3-vitl` for v3, `Ruicheng/moge-2-vitl-normal` for v2, `Ruicheng/moge-vitl` for v1). You can also pass `Ruicheng/moge-3-vitg` or a local checkpoint path. |
 | **`--refine_steps`** | `int` $\ge 0$ | `3` | *(v3 only)* Number of sparse 3D refinement iterations.<br>• **Higher (e.g., 4–5)**: Sharpens thin structures, wires, and occlusion boundaries; adds linear inference time per step.<br>• **Lower (e.g., 1–2)**: Faster execution.<br>• **0**: Disables refinement, falling back to base feed-forward output. |
 | **`--split_resolution`** | `int` (e.g. 256–1024) | `512` | Pixel resolution for each of the 12 perspective views sampled on the icosahedron.<br>• **Higher (e.g., 768, 1024)**: Captures higher-frequency textures and details in the 360° stitch; requires more GPU VRAM and processing time.<br>• **Lower (e.g., 256, 384)**: Fast inference, lower VRAM consumption, but coarser sampling. |
 | **`--resolution_level`** | `int` `[0-9]` | `9` | Controls inference token density for the ViT backbone.<br>• **Higher (e.g., 8–9)**: Captures fine geometrical details; higher computational cost.<br>• **Lower (e.g., 0–5)**: Faster inference, lower GPU memory; produces smoother geometry. |
