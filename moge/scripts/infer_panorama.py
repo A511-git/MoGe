@@ -27,6 +27,7 @@ import click
 @click.option('--threshold', type=float, default=0.03, help='Threshold for removing edges. Defaults to 0.03. Smaller value removes more edges. "inf" means no thresholding.')
 @click.option('--batch_size', type=int, default=4, help='Batch size for inference. Defaults to 4.')
 @click.option('--merge_method', type=click.Choice(['raycast', 'poisson']), default='raycast', help='Method for merging panorama 2D maps: "raycast" (default, fast, metric-accurate) or "poisson" (legacy gradient integration).')
+@click.option('--planar_floor/--no_planar_floor', 'planar_floor', default=True, help='Fit a planar ground floor and snap floor points to prevent ground splatter. Defaults to True.')
 @click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted perspective views and all associated data (RGB, depth, distance, points, mask, normal, cameras). Defaults to False.')
 @click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, normal, fov).')
 @click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a .glb file. The color will be saved as a texture.')
@@ -47,6 +48,7 @@ def main(
     threshold: float,
     batch_size: int,
     merge_method: str,
+    planar_floor: bool,
     save_splitted: bool,
     save_maps_: bool,
     save_glb_: bool,
@@ -194,6 +196,20 @@ def main(
             with open(splitted_save_path / 'cameras.json', 'w') as f:
                 json.dump({'views': cameras_meta}, f, indent=2)
 
+        # Build 3D mesh directly in world space
+        ground_plane = None
+        if save_glb_ or save_ply_ or show:
+            print('Building 3D multi-view mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 3D mesh')
+            vertices, faces, vertex_colors, vertex_normals, ground_plane = build_panorama_mesh_multiview(
+                splitted_images,
+                splitted_points_maps,
+                splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
+                splitted_masks,
+                splitted_extrinsics,
+                threshold=threshold,
+                planar_floor=planar_floor
+            )
+
         # Merge 2D maps
         print('Merging 2D maps...') if pbar.disable else pbar.set_postfix_str(f'Merging 2D maps')
         if merge_method == 'raycast':
@@ -201,7 +217,8 @@ def main(
                 width, height,
                 splitted_distance_maps, splitted_masks,
                 splitted_extrinsics, splitted_intriniscs,
-                normal_maps=splitted_normal_maps if len(splitted_normal_maps) > 0 else None
+                normal_maps=splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
+                ground_plane=ground_plane
             )
             points = panorama_depth[:, :, None] * spherical_uv_to_directions(utils3d.np.uv_map(height, width))
             if panorama_normal is None:
@@ -224,18 +241,6 @@ def main(
             cv2.imwrite(str(save_path / 'depth.exr'), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
             cv2.imwrite(str(save_path / 'points.exr'), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
             cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
-
-        # Build 3D mesh directly in world space
-        if save_glb_ or save_ply_ or show:
-            print('Building 3D multi-view mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 3D mesh')
-            vertices, faces, vertex_colors, vertex_normals = build_panorama_mesh_multiview(
-                splitted_images,
-                splitted_points_maps,
-                splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
-                splitted_masks,
-                splitted_extrinsics,
-                threshold=threshold
-            )
 
         if save_glb_:
             save_glb(save_path / 'mesh.glb', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)

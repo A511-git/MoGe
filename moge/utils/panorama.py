@@ -193,6 +193,79 @@ def merge_panorama_depth(width: int, height: int, distance_maps: List[np.ndarray
     return panorama_depth, panorama_mask
 
 
+def fit_ground_plane(
+    splitted_points: List[np.ndarray],
+    splitted_normals: Optional[List[np.ndarray]],
+    splitted_masks: List[np.ndarray],
+    splitted_extrinsics: List[np.ndarray],
+) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Fits the ground floor plane (n . P + d = 0) using upward-facing surface normals
+    in world coordinates (Z is UP, floor is at negative Z).
+    Returns (n_floor, d) where n_floor is approximately [0, 0, 1] and d > 0.
+    """
+    if splitted_normals is None or not any(n is not None for n in splitted_normals):
+        return None
+
+    floor_pts_list = []
+    for i in range(len(splitted_points)):
+        if splitted_normals[i] is None:
+            continue
+        R = splitted_extrinsics[i][:3, :3]
+        pts = splitted_points[i]
+        norm = splitted_normals[i]
+        mask = splitted_masks[i] & (pts[..., 2] > 0)
+
+        # Rotate to world coordinates: P_world = P_cam @ R
+        pts_w = pts @ R
+        norm_w = norm @ R
+
+        # Candidate floor: below camera (Z < -0.3) and normal pointing UP (norm_w[..., 2] > 0.80)
+        is_floor_cand = mask & (pts_w[..., 2] < -0.3) & (norm_w[..., 2] > 0.80)
+        if np.any(is_floor_cand):
+            floor_pts_list.append(pts_w[is_floor_cand])
+
+    if len(floor_pts_list) == 0:
+        return None
+
+    all_cand_pts = np.concatenate(floor_pts_list, axis=0)
+    if len(all_cand_pts) < 100:
+        return None
+
+    # Subsample if too many points for speed
+    if len(all_cand_pts) > 20000:
+        idx = np.random.choice(len(all_cand_pts), 20000, replace=False)
+        all_cand_pts = all_cand_pts[idx]
+
+    # Robust median height
+    z_vals = all_cand_pts[:, 2]
+    z_median = float(np.median(z_vals))
+    inlier_mask = np.abs(z_vals - z_median) < 0.20
+    inlier_pts = all_cand_pts[inlier_mask]
+
+    if len(inlier_pts) < 50:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32), float(-z_median)
+
+    # Fit plane n . P + d = 0 using SVD on inliers
+    centroid = np.mean(inlier_pts, axis=0)
+    _, _, vh = np.linalg.svd(inlier_pts - centroid)
+    normal = vh[2]
+
+    # Ensure normal points UP (positive Z)
+    if normal[2] < 0:
+        normal = -normal
+
+    # If normal is too tilted (> 20 deg from vertical), force horizontal [0, 0, 1]
+    if normal[2] < 0.94:
+        normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        d = float(-centroid[2])
+    else:
+        normal = (normal / np.linalg.norm(normal)).astype(np.float32)
+        d = float(-np.dot(normal, centroid))
+
+    return normal, d
+
+
 def merge_panorama_depth_raycast(
     width: int, 
     height: int, 
@@ -201,11 +274,12 @@ def merge_panorama_depth_raycast(
     extrinsics: List[np.ndarray], 
     intrinsics: List[np.ndarray],
     normal_maps: Optional[List[np.ndarray]] = None,
+    ground_plane: Optional[Tuple[np.ndarray, float]] = None,
     power: float = 2.0
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Direct Spherical Cosine-Weighted Raycasting Fusion for 360 Panorama.
-    Preserves exact metric scale and avoids polar distortion or integration drift.
+    Preserves exact metric scale, eliminates polar distortion, and optionally snaps floor rays.
     """
     uv = utils3d.np.uv_map(height, width)
     spherical_directions = spherical_uv_to_directions(uv)
@@ -248,6 +322,17 @@ def merge_panorama_depth_raycast(
     else:
         panorama_normal = None
 
+    # Snap floor rays if ground plane is provided
+    if ground_plane is not None and panorama_normal is not None:
+        n_floor, d_floor = ground_plane
+        denom = np.sum(spherical_directions * n_floor, axis=-1)
+        is_floor_ray = (spherical_directions[..., 2] < -0.15) & (denom < -0.05) & (panorama_normal[..., 2] > 0.70)
+        r_floor = -d_floor / np.minimum(denom, -0.05)
+        depth_diff = np.abs(panorama_depth - r_floor)
+        snap_mask = is_floor_ray & (depth_diff < 0.35)
+        panorama_depth[snap_mask] = r_floor[snap_mask]
+        panorama_normal[snap_mask] = n_floor
+
     return panorama_depth, panorama_mask, panorama_normal
 
 
@@ -258,36 +343,75 @@ def build_panorama_mesh_multiview(
     splitted_masks: List[np.ndarray],
     splitted_extrinsics: List[np.ndarray],
     threshold: float = 0.03,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    planar_floor: bool = True,
+    ground_plane: Optional[Tuple[np.ndarray, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[Tuple[np.ndarray, float]]]:
     """
     Direct Multi-View 3D Mesh Reconstruction for 360 Panorama.
-    Builds clean perspective meshes from each icosahedral view, eliminates flying edges,
-    and rotates all vertices and normals into global world space.
+    Builds clean perspective meshes from each icosahedral view, eliminates grazing-angle splatter,
+    snaps floor points to a flat ground plane, and rotates all geometry into global world space.
     """
+    has_normals = splitted_normals is not None and any(n is not None for n in splitted_normals)
+
+    # Fit ground plane if requested and not provided
+    if planar_floor and ground_plane is None and has_normals:
+        ground_plane = fit_ground_plane(splitted_points, splitted_normals, splitted_masks, splitted_extrinsics)
+
     vertices_list = []
     faces_list = []
     colors_list = []
     normals_list = []
     total_vertices = 0
 
-    has_normals = splitted_normals is not None and any(n is not None for n in splitted_normals)
-
     for i in range(len(splitted_images)):
-        points = splitted_points[i]
-        mask = splitted_masks[i]
+        points = splitted_points[i].copy()
+        mask = splitted_masks[i].copy()
         image = splitted_images[i]
         R = splitted_extrinsics[i][:3, :3]
-
         H, W = points.shape[:2]
+
+        view_has_normal = has_normals and splitted_normals[i] is not None
+        normal = splitted_normals[i].copy() if view_has_normal else None
+
+        valid_snap = np.zeros((H, W), dtype=bool)
+
+        # Ground plane snapping
+        if ground_plane is not None and view_has_normal:
+            n_floor, d_floor = ground_plane
+            pts_w = points @ R
+            norm_w = normal @ R
+
+            dist_to_plane = np.abs(np.sum(pts_w * n_floor, axis=-1) + d_floor)
+            is_floor = (pts_w[..., 2] < -0.3) & (norm_w[..., 2] > 0.75) & (dist_to_plane < 0.25)
+
+            ray_w = pts_w / np.maximum(np.linalg.norm(pts_w, axis=-1, keepdims=True), 1e-6)
+            denom = np.sum(ray_w * n_floor, axis=-1)
+            valid_snap = is_floor & (denom < -0.05)
+
+            if np.any(valid_snap):
+                r_exact = -d_floor / np.minimum(denom, -0.05)
+                pts_w[valid_snap] = ray_w[valid_snap] * r_exact[valid_snap, None]
+                points[valid_snap] = pts_w[valid_snap] @ R.T
+                normal[valid_snap] = n_floor @ R.T
+
         depth = points[..., 2]
         mask_cleaned = mask & (depth > 0)
 
-        view_has_normal = has_normals and splitted_normals[i] is not None
+        # Edge discontinuity pruning
         if threshold < float('inf'):
             edge_mask = utils3d.np.depth_map_edge(depth, rtol=threshold)
             if view_has_normal:
-                edge_mask = edge_mask & utils3d.np.normal_map_edge(splitted_normals[i], tol=5)
+                edge_mask = edge_mask & utils3d.np.normal_map_edge(normal, tol=5)
+            # Do not cut edges on flat floor
+            edge_mask = edge_mask & ~valid_snap
             mask_cleaned = mask_cleaned & ~edge_mask
+
+        # Grazing angle filtering: remove points where viewing ray is nearly parallel to surface
+        if view_has_normal:
+            v_cam = points / np.maximum(np.linalg.norm(points, axis=-1, keepdims=True), 1e-6)
+            cos_inc = -np.sum(v_cam * normal, axis=-1)
+            grazing_mask = (cos_inc < 0.20) & (~valid_snap)
+            mask_cleaned = mask_cleaned & ~grazing_mask
 
         uv = utils3d.np.uv_map((H, W))
         if view_has_normal:
@@ -295,7 +419,7 @@ def build_panorama_mesh_multiview(
                 points,
                 image.astype(np.float32) / 255.0,
                 uv,
-                splitted_normals[i],
+                normal,
                 mask=mask_cleaned,
                 tri=True
             )
@@ -312,6 +436,21 @@ def build_panorama_mesh_multiview(
         if len(vert_i) == 0 or len(faces_i) == 0:
             continue
 
+        # Prune stretched / flying triangles with oversized edge-to-distance ratio
+        v0 = vert_i[faces_i[:, 0]]
+        v1 = vert_i[faces_i[:, 1]]
+        v2 = vert_i[faces_i[:, 2]]
+        d01 = np.linalg.norm(v0 - v1, axis=-1)
+        d12 = np.linalg.norm(v1 - v2, axis=-1)
+        d20 = np.linalg.norm(v2 - v0, axis=-1)
+        max_edge = np.maximum(np.maximum(d01, d12), d20)
+        min_dist = np.minimum(np.minimum(np.linalg.norm(v0, axis=-1), np.linalg.norm(v1, axis=-1)), np.linalg.norm(v2, axis=-1))
+
+        valid_tri = max_edge < (0.25 * min_dist + 0.15)
+        faces_i = faces_i[valid_tri]
+        if len(faces_i) == 0:
+            continue
+
         # Rotate camera coordinates to world coordinates: P_world = P_cam @ R
         vert_world_i = vert_i @ R
         vertices_list.append(vert_world_i)
@@ -325,7 +464,7 @@ def build_panorama_mesh_multiview(
         total_vertices += len(vert_world_i)
 
     if total_vertices == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None, ground_plane
 
     all_vertices = np.concatenate(vertices_list, axis=0)
     all_faces = np.concatenate(faces_list, axis=0)
@@ -338,5 +477,5 @@ def build_panorama_mesh_multiview(
     if all_normals is not None:
         all_normals = all_normals * [1, -1, -1]
 
-    return all_vertices, all_faces, all_colors, all_normals
+    return all_vertices, all_faces, all_colors, all_normals, ground_plane
          
