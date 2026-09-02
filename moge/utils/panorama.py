@@ -191,4 +191,152 @@ def merge_panorama_depth(width: int, height: int, distance_maps: List[np.ndarray
     panorama_mask = np.any(panorama_pred_masks, axis=0)
 
     return panorama_depth, panorama_mask
+
+
+def merge_panorama_depth_raycast(
+    width: int, 
+    height: int, 
+    distance_maps: List[np.ndarray], 
+    pred_masks: List[np.ndarray], 
+    extrinsics: List[np.ndarray], 
+    intrinsics: List[np.ndarray],
+    normal_maps: Optional[List[np.ndarray]] = None,
+    power: float = 2.0
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Direct Spherical Cosine-Weighted Raycasting Fusion for 360 Panorama.
+    Preserves exact metric scale and avoids polar distortion or integration drift.
+    """
+    uv = utils3d.np.uv_map(height, width)
+    spherical_directions = spherical_uv_to_directions(uv)
+
+    accum_dist = np.zeros((height, width), dtype=np.float32)
+    accum_weight = np.zeros((height, width), dtype=np.float32)
+    has_normals = normal_maps is not None and any(n is not None for n in normal_maps)
+    accum_normal = np.zeros((height, width, 3), dtype=np.float32) if has_normals else None
+    panorama_mask = np.zeros((height, width), dtype=bool)
+
+    for i in range(len(distance_maps)):
+        R = extrinsics[i][:3, :3]
+        optical_axis = extrinsics[i][2, :3]
+
+        projected_uv, projected_depth = utils3d.np.project_cv(spherical_directions, extrinsics=extrinsics[i], intrinsics=intrinsics[i])
+        valid = (projected_depth > 0) & (projected_uv > 0).all(axis=-1) & (projected_uv < 1).all(axis=-1)
+
+        projected_pixels = utils3d.np.uv_to_pixel(np.clip(projected_uv, 0, 1), distance_maps[i].shape).astype(np.float32)
+        sampled_dist = cv2.remap(distance_maps[i], projected_pixels[..., 0], projected_pixels[..., 1], cv2.INTER_LINEAR)
+        sampled_mask = (cv2.remap(pred_masks[i].astype(np.uint8), projected_pixels[..., 0], projected_pixels[..., 1], cv2.INTER_NEAREST) > 0) & valid
+
+        cos_theta = np.clip(np.sum(spherical_directions * optical_axis, axis=-1), 0, 1)
+        weight = np.where(sampled_mask, np.power(cos_theta, power), 0.0).astype(np.float32)
+
+        accum_dist += sampled_dist * weight
+        accum_weight += weight
+        panorama_mask |= sampled_mask
+
+        if has_normals and normal_maps[i] is not None:
+            sampled_norm_cam = cv2.remap(normal_maps[i], projected_pixels[..., 0], projected_pixels[..., 1], cv2.INTER_LINEAR)
+            sampled_norm_world = sampled_norm_cam @ R
+            accum_normal += sampled_norm_world * weight[..., None]
+
+    nonzero = accum_weight > 1e-6
+    panorama_depth = np.where(nonzero, accum_dist / np.maximum(accum_weight, 1e-6), 0.0).astype(np.float32)
+
+    if accum_normal is not None:
+        norm_len = np.linalg.norm(accum_normal, axis=-1, keepdims=True)
+        panorama_normal = np.where(norm_len > 1e-6, accum_normal / np.maximum(norm_len, 1e-6), 0.0).astype(np.float32)
+    else:
+        panorama_normal = None
+
+    return panorama_depth, panorama_mask, panorama_normal
+
+
+def build_panorama_mesh_multiview(
+    splitted_images: List[np.ndarray],
+    splitted_points: List[np.ndarray],
+    splitted_normals: Optional[List[np.ndarray]],
+    splitted_masks: List[np.ndarray],
+    splitted_extrinsics: List[np.ndarray],
+    threshold: float = 0.03,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Direct Multi-View 3D Mesh Reconstruction for 360 Panorama.
+    Builds clean perspective meshes from each icosahedral view, eliminates flying edges,
+    and rotates all vertices and normals into global world space.
+    """
+    vertices_list = []
+    faces_list = []
+    colors_list = []
+    normals_list = []
+    total_vertices = 0
+
+    has_normals = splitted_normals is not None and any(n is not None for n in splitted_normals)
+
+    for i in range(len(splitted_images)):
+        points = splitted_points[i]
+        mask = splitted_masks[i]
+        image = splitted_images[i]
+        R = splitted_extrinsics[i][:3, :3]
+
+        H, W = points.shape[:2]
+        depth = points[..., 2]
+        mask_cleaned = mask & (depth > 0)
+
+        view_has_normal = has_normals and splitted_normals[i] is not None
+        if threshold < float('inf'):
+            edge_mask = utils3d.np.depth_map_edge(depth, rtol=threshold)
+            if view_has_normal:
+                edge_mask = edge_mask & utils3d.np.normal_map_edge(splitted_normals[i], tol=5)
+            mask_cleaned = mask_cleaned & ~edge_mask
+
+        uv = utils3d.np.uv_map((H, W))
+        if view_has_normal:
+            faces_i, vert_i, colors_i, _, norm_i = utils3d.np.build_mesh_from_map(
+                points,
+                image.astype(np.float32) / 255.0,
+                uv,
+                splitted_normals[i],
+                mask=mask_cleaned,
+                tri=True
+            )
+        else:
+            faces_i, vert_i, colors_i, _ = utils3d.np.build_mesh_from_map(
+                points,
+                image.astype(np.float32) / 255.0,
+                uv,
+                mask=mask_cleaned,
+                tri=True
+            )
+            norm_i = None
+
+        if len(vert_i) == 0 or len(faces_i) == 0:
+            continue
+
+        # Rotate camera coordinates to world coordinates: P_world = P_cam @ R
+        vert_world_i = vert_i @ R
+        vertices_list.append(vert_world_i)
+        faces_list.append(faces_i + total_vertices)
+        colors_list.append(colors_i)
+
+        if norm_i is not None:
+            norm_world_i = norm_i @ R
+            normals_list.append(norm_world_i)
+
+        total_vertices += len(vert_world_i)
+
+    if total_vertices == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None
+
+    all_vertices = np.concatenate(vertices_list, axis=0)
+    all_faces = np.concatenate(faces_list, axis=0)
+    all_colors = np.concatenate(colors_list, axis=0)
+    all_normals = np.concatenate(normals_list, axis=0) if len(normals_list) > 0 else None
+
+    # OpenGL coordinate conventions:
+    # world coordinate system: x right, y up, z backward.
+    all_vertices = all_vertices * [1, -1, -1]
+    if all_normals is not None:
+        all_normals = all_normals * [1, -1, -1]
+
+    return all_vertices, all_faces, all_colors, all_normals
          

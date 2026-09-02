@@ -19,18 +19,17 @@ def save_glb(
     save_path: Union[str, os.PathLike], 
     vertices: np.ndarray, 
     faces: np.ndarray, 
-    vertex_uvs: np.ndarray,
-    texture: np.ndarray,
+    vertex_uvs: Optional[np.ndarray] = None,
+    texture: Optional[np.ndarray] = None,
     vertex_normals: Optional[np.ndarray] = None,
+    vertex_colors: Optional[np.ndarray] = None,
 ):
     import trimesh
     import trimesh.visual
     from PIL import Image
 
-    trimesh.Trimesh(
-        vertices=vertices, 
-        vertex_normals=vertex_normals,
-        faces=faces, 
+    visual = None
+    if vertex_uvs is not None and texture is not None:
         visual = trimesh.visual.texture.TextureVisuals(
             uv=vertex_uvs, 
             material=trimesh.visual.material.PBRMaterial(
@@ -38,7 +37,17 @@ def save_glb(
                 metallicFactor=0.5,
                 roughnessFactor=1.0
             )
-        ),
+        )
+    elif vertex_colors is not None:
+        visual = trimesh.visual.ColorVisuals(
+            vertex_colors=vertex_colors
+        )
+
+    trimesh.Trimesh(
+        vertices=vertices, 
+        vertex_normals=vertex_normals,
+        faces=faces, 
+        visual=visual,
         process=False
     ).export(save_path)
 
