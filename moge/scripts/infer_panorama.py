@@ -15,24 +15,34 @@ import click
 @click.command(help='Inference script for panorama images')
 @click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input image or folder path. "jpg" and "png" are supported.')
 @click.option('--output', '-o', 'output_path', type=click.Path(), default='./output', help='Output folder path')
-@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
+@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
+@click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', help='Model version. Defaults to "v3"')
 @click.option('--device', 'device_name', type=str, default='cuda', help='Device name (e.g. "cuda", "cuda:0", "cpu"). Defaults to "cuda"')
+@click.option('--fp16', 'use_fp16', is_flag=True, help='Use fp16 precision for faster inference.')
 @click.option('--resize', 'resize_to', type=int, default=None, help='Resize the image(s) & output maps to a specific size. Defaults to None (no resizing).')
 @click.option('--resolution_level', type=int, default=9, help='An integer [0-9] for the resolution level of inference. The higher, the better but slower. Defaults to 9. Note that it is irrelevant to the output resolution.')
+@click.option('--num_tokens', type=int, default=None, help='Number of tokens used for inference. Overrides resolution_level if provided.')
+@click.option('--refine_steps', type=click.IntRange(min=0), default=3, help='Number of sparse refinement steps for v3. Defaults to 3.')
+@click.option('--split_resolution', type=int, default=512, help='Resolution for each splitted perspective view. Defaults to 512.')
 @click.option('--threshold', type=float, default=0.03, help='Threshold for removing edges. Defaults to 0.03. Smaller value removes more edges. "inf" means no thresholding.')
 @click.option('--batch_size', type=int, default=4, help='Batch size for inference. Defaults to 4.')
 @click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted perspective views and all associated data (RGB, depth, distance, points, mask, normal, cameras). Defaults to False.')
-@click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, fov).')
-@click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a.glb file. The color will be saved as a texture.')
-@click.option('--ply', 'save_ply_', is_flag=True, help='Whether to save the output as a.ply file. The color will be saved as vertex colors.')
+@click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, normal, fov).')
+@click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a .glb file. The color will be saved as a texture.')
+@click.option('--ply', 'save_ply_', is_flag=True, help='Whether to save the output as a .ply file. The color will be saved as vertex colors.')
 @click.option('--show', 'show', is_flag=True, help='Whether show the output in a window. Note that this requires pyglet<2 installed as required by trimesh.')
 def main(
     input_path: str,
     output_path: str,
     pretrained_model_name_or_path: str,
+    model_version: str,
     device_name: str,
+    use_fp16: bool,
     resize_to: int,
     resolution_level: int,
+    num_tokens: int,
+    refine_steps: int,
+    split_resolution: int,
     threshold: float,
     batch_size: int,
     save_splitted: bool,
@@ -58,7 +68,7 @@ def main(
         import utils3d_moge as utils3d
     except ImportError:
         import utils3d
-    from moge.model.v1 import MoGeModel
+    from moge.model import import_model_class_by_version
     from moge.utils.io import save_glb, save_ply
     from moge.utils.vis import colorize_depth, colorize_normal
     from moge.utils.panorama import spherical_uv_to_directions, get_panorama_cameras, split_panorama_image, merge_panorama_depth
@@ -80,7 +90,18 @@ def main(
         warnings.warn('No output format specified. Defaults to saving all. Please use "--maps", "--glb", or "--ply" to specify the output.')
         save_maps_ = save_glb_ = save_ply_ = True
 
-    model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
+    if pretrained_model_name_or_path is None:
+        default_pretrained_models = {
+            'v1': 'Ruicheng/moge-vitl',
+            'v2': 'Ruicheng/moge-2-vitl-normal',
+        }
+        if model_version == 'v3':
+            raise click.UsageError('MoGe-3 checkpoints are not released to Huggingface yet. Please provide a local path to the checkpoint via --pretrained.')
+        pretrained_model_name_or_path = default_pretrained_models[model_version]
+
+    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
+    if use_fp16 and model_version != 'v3':
+        model.half()
 
     for image_path in (pbar := tqdm(image_paths, desc='Total images', disable=len(image_paths) <= 1)):
         image = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
@@ -93,8 +114,7 @@ def main(
         save_path.mkdir(exist_ok=True, parents=True)
 
         splitted_extrinsics, splitted_intriniscs = get_panorama_cameras()
-        splitted_resolution = 512
-        splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intriniscs, splitted_resolution)
+        splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intriniscs, split_resolution)
 
         # Infer each view 
         print('Inferring...') if pbar.disable else pbar.set_postfix_str(f'Inferring')
@@ -107,7 +127,19 @@ def main(
             image_tensor = torch.tensor(np.stack(splitted_images[i:i + batch_size]) / 255, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
             fov_x, fov_y = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intriniscs[i:i + batch_size])))
             fov_x = torch.tensor(fov_x, dtype=torch.float32, device=device)
-            output = model.infer(image_tensor, fov_x=fov_x, apply_mask=False)
+
+            infer_kwargs = {
+                'fov_x': fov_x,
+                'resolution_level': resolution_level,
+                'apply_mask': False,
+            }
+            if num_tokens is not None:
+                infer_kwargs['num_tokens'] = num_tokens
+            if model_version == 'v3':
+                infer_kwargs['refine_steps'] = refine_steps
+                infer_kwargs['use_fp16'] = use_fp16
+
+            output = model.infer(image_tensor, **infer_kwargs)
             distance_map, mask = output['points'].norm(dim=-1).cpu().numpy(), output['mask'].cpu().numpy()
             splitted_distance_maps.extend(list(distance_map))
             splitted_masks.extend(list(mask))
@@ -167,18 +199,21 @@ def main(
         panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (width, height), cv2.INTER_NEAREST) > 0
         points = panorama_depth[:, :, None] * spherical_uv_to_directions(utils3d.np.uv_map(height, width))
         
+        if save_maps_ or save_glb_ or save_ply_ or show:
+            normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
+
         # Write outputs
         print('Writing outputs...') if pbar.disable else pbar.set_postfix_str(f'Writing outputs')
         if save_maps_:
             cv2.imwrite(str(save_path / 'image.jpg'), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(save_path / 'normal_vis.png'), cv2.cvtColor(colorize_normal(normals, mask=normals_mask), cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(save_path / 'depth.exr'), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
             cv2.imwrite(str(save_path / 'points.exr'), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-            cv2.imwrite(str(save_path /'mask.png'), (panorama_mask * 255).astype(np.uint8))
+            cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
 
         # Export mesh & visulization
         if save_glb_ or save_ply_ or show:
-            normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
             faces, vertices, vertex_colors, vertex_uvs = utils3d.np.build_mesh_from_map(
                 points,
                 image.astype(np.float32) / 255,

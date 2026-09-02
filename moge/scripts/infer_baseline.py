@@ -37,7 +37,7 @@ def main(ctx: click.Context, baseline_code_path: str, input_path: str, output_pa
 
     from moge.utils.io import save_ply, save_glb
     from moge.utils.geometry_numpy import intrinsics_to_fov_numpy
-    from moge.utils.vis import colorize_depth, colorize_depth_affine, colorize_disparity
+    from moge.utils.vis import colorize_depth, colorize_depth_affine, colorize_disparity, colorize_normal
     from moge.utils.tools import key_average, flatten_nested_dict, timeit, import_file_as_module
     from moge.test.baseline import MGEBaselineInterface
 
@@ -105,6 +105,10 @@ def main(ctx: click.Context, baseline_code_path: str, input_path: str, output_pa
                         depth_vis = colorize_disparity(depth)
                     cv2.imwrite(str(save_path / f'{k}_vis.png'), cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR))
                 
+            if 'normal' in output and output['normal'] is not None:
+                normal = output['normal'].cpu().numpy()
+                cv2.imwrite(str(save_path / 'normal.png'), cv2.cvtColor(colorize_normal(normal), cv2.COLOR_RGB2BGR))
+
             if 'intrinsics' in output:
                 intrinsics = output['intrinsics'].cpu().numpy()
                 fov_x, fov_y = intrinsics_to_fov_numpy(intrinsics)

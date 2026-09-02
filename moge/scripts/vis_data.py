@@ -18,7 +18,6 @@ import click
 @click.option('--ply', 'save_ply', is_flag=True, help='save point cloud as PLY file')
 @click.option('--depth_vis', 'save_depth_vis', is_flag=True, help='save depth image')
 @click.option('--inf', 'inf_mask', is_flag=True, help='use infinity mask')
-@click.option('--version', 'version', type=str, default='v3', help='version of rgbd data')
 def main(
     folder_or_path: str,
     output_folder: str,
@@ -29,7 +28,6 @@ def main(
     save_ply: bool,
     save_depth_vis: bool,
     inf_mask: bool,
-    version: str
 ):  
     # Lazy import
     import cv2

@@ -245,7 +245,16 @@ class MoGeModel(nn.Module):
         return model
 
     def init_weights(self):
-        "Load the backbone with pretrained dinov2 weights from torch hub"
+        """Load the backbone with pretrained dinov2 weights."""
+        try:
+            from .modules.dinov2.hub import backbones as dinov2_hub
+            if hasattr(dinov2_hub, self.encoder):
+                backbone_fn = getattr(dinov2_hub, self.encoder)
+                state_dict = backbone_fn(pretrained=True).state_dict()
+                self.backbone.load_state_dict(state_dict)
+                return
+        except Exception:
+            pass
         state_dict = torch.hub.load('facebookresearch/dinov2', self.encoder, pretrained=True).state_dict()
         self.backbone.load_state_dict(state_dict)
     

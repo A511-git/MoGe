@@ -308,6 +308,39 @@ The output maps will be combined to produce a panorama depth map and point map.
 
 Note that the panorama image must have spherical parameterization (e.g., environment maps or equirectangular images). Other formats must be converted to spherical format before using this script. Run `moge infer_panorama --help` for detailed options.
 
+```bash
+# Infer panorama with MoGe-2
+moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 -o OUTPUT_FOLDER --maps --glb --ply
+
+# Infer panorama with MoGe-3 (using iterative refinement)
+moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v3 --pretrained PATH_TO_CKPT.pt --refine_steps 3 -o OUTPUT_FOLDER --maps --glb --ply
+
+# Export all individual splitted perspective views and multi-view cameras
+moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 --splitted -o OUTPUT_FOLDER
+```
+
+#### ⚙️ Parameters & Tuning Guide
+
+| Parameter | Type / Range | Default | Impact as Value Goes Up (↑) / Down (↓) |
+| :--- | :--- | :--- | :--- |
+| **`--version`** | `v1` \| `v2` \| `v3` | `v3` | Selects architecture. `v1`: baseline affine depth; `v2`: predicts sharp surface normals & metric scale; `v3`: adds iterative sparse 3D U-Net refinement. |
+| **`--pretrained`** | `str` (path / repo) | `None` | Pretrained weights. For `v1`/`v2`, auto-downloads from HuggingFace if `None`. For `v3`, requires a local path to the checkpoint `.pt`. |
+| **`--refine_steps`** | `int` $\ge 0$ | `3` | *(v3 only)* Number of sparse 3D refinement iterations.<br>• **Higher (e.g., 4–5)**: Sharpens thin structures, wires, and occlusion boundaries; adds linear inference time per step.<br>• **Lower (e.g., 1–2)**: Faster execution.<br>• **0**: Disables refinement, falling back to base feed-forward output. |
+| **`--split_resolution`** | `int` (e.g. 256–1024) | `512` | Pixel resolution for each of the 12 perspective views sampled on the icosahedron.<br>• **Higher (e.g., 768, 1024)**: Captures higher-frequency textures and details in the 360° stitch; requires more GPU VRAM and processing time.<br>• **Lower (e.g., 256, 384)**: Fast inference, lower VRAM consumption, but coarser sampling. |
+| **`--resolution_level`** | `int` `[0-9]` | `9` | Controls inference token density for the ViT backbone.<br>• **Higher (e.g., 8–9)**: Captures fine geometrical details; higher computational cost.<br>• **Lower (e.g., 0–5)**: Faster inference, lower GPU memory; produces smoother geometry. |
+| **`--num_tokens`** | `int` (1200–3600) | `None` | Overrides `--resolution_level` with exact token count.<br>• **Higher**: More ViT tokens, higher spatial precision.<br>• **Lower**: Fewer tokens, faster inference. |
+| **`--batch_size`** | `int` $\ge 1$ | `4` | Number of perspective views inferred concurrently (12 total views).<br>• **Higher (e.g., 6 or 12)**: Increases throughput on high-memory GPUs (e.g., A100/H100).<br>• **Lower (e.g., 1 or 2)**: Essential to avoid CUDA Out-Of-Memory (OOM) on GPUs with $\le 8$ GB VRAM. |
+| **`--threshold`** | `float` (or `inf`) | `0.03` | Relative depth jump threshold (`rtol`) for filtering stretched triangles at depth discontinuities during mesh extraction.<br>• **Lower (e.g., 0.01–0.02)**: Stricter edge removal; aggressively eliminates flying edges/streaks at object boundaries, but may create small holes.<br>• **Higher (e.g., 0.05–0.1)**: Keeps more connecting triangles across surface steps.<br>• **`inf`**: Disables edge thresholding completely. |
+| **`--resize`** | `int` (pixels) | `None` | Resizes input panorama and output maps to a maximum dimension.<br>• **Higher / None**: Maintains full native resolution of high-res panoramas.<br>• **Lower (e.g., 1024, 2048)**: Significantly accelerates Poisson merge and 3D mesh building. |
+| **`--fp16`** | Flag | `False` | Uses FP16 mixed precision.<br>• **Enabled**: Cuts GPU memory footprint in half and roughly doubles speed on modern NVIDIA GPUs. |
+| **`--device`** | `str` | `cuda` | Computing device (e.g., `cuda`, `cuda:0`, or `cpu`). |
+| **`--splitted`** | Flag | `False` | Saves all 12 individual perspective crops and their full metadata (`.jpg`, `.exr` depth/distance/points, `.png` mask/normal, `{i:02d}_camera.json`, and multi-view `cameras.json`). |
+| **`--maps`** | Flag | `True`* | Saves 2D map outputs: `image.jpg`, `depth.exr`, `depth_vis.png`, `normal_vis.png`, `points.exr`, and `mask.png`. |
+| **`--glb`** | Flag | `True`* | Exports textured 3D mesh as a `.glb` file. |
+| **`--ply`** | Flag | `True`* | Exports 3D point cloud / mesh as a `.ply` file with vertex colors. |
+| **`--show`** | Flag | `False` | Opens an interactive 3D viewer window using Trimesh (requires `pyglet<2`). |
+
+*\* If none of `--maps`, `--glb`, or `--ply` are specified, all three are saved by default.*
 
 <div align="center">
   <img src="./assets/panorama_pipeline.png" width="80%">
