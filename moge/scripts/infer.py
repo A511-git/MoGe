@@ -82,9 +82,8 @@ def main(
         default_pretrained_models = {
             'v1': 'Ruicheng/moge-vitl',
             'v2': 'Ruicheng/moge-2-vitl-normal',
+            'v3': 'Ruicheng/moge-3-vitl',
         }
-        if model_version == 'v3':
-            raise click.UsageError('MoGe-3 checkpoints are not released to Huggingface yet. Please provide a local path to the checkpoint.')
         pretrained_model_name_or_path = default_pretrained_models[model_version]
     model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
     if use_fp16 and model_version != 'v3':

@@ -21,8 +21,9 @@ TEMP_DIR = Path(tempfile.gettempdir(), 'moge')
 @click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
 @click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
 @click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
+@click.option('--device', 'device_name', type=str, default='cuda', help='Device name (e.g. "cuda", "cuda:0", "cpu"). Defaults to "cuda".')
 @click.option('--fp16/--fp32', 'use_fp16', default=True, help='Whether to use fp16 or fp32 inference.')
-def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
+def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, device_name: str, use_fp16: bool):
     print("Import modules...")
     # Lazy import
     import cv2
@@ -55,14 +56,19 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
     from moge.utils.tools import timeit
 
     print("Load model...")
+    device = torch.device(device_name if torch.cuda.is_available() or device_name == 'cpu' else 'cpu')
+
     if pretrained_model_name_or_path is None:
         default_pretrained_models = {
             'v1': 'Ruicheng/moge-vitl',
             'v2': 'Ruicheng/moge-2-vitl-normal',
-            'v3': 'Ruicheng/moge-3-vitl'
+            'v3': 'Ruicheng/moge-3-vitl',
         }
         pretrained_model_name_or_path = default_pretrained_models[model_version]
-    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).cuda().eval()
+    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
+    if use_fp16 and model_version != 'v3' and device.type == 'cuda':
+        model.half()
+
     thread_pool_executor = ThreadPoolExecutor(max_workers=1)
     TEMP_DIR.mkdir(exist_ok=True)
 
@@ -78,14 +84,14 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         thread_pool_executor.submit(_wait_and_delete)
         atexit.register(_delete)
 
-    # Inference on GPU. 
+    # Inference on GPU / Device
     @(spaces.GPU if HUGGINGFACE_SPACES_INSTALLED else lambda x: x)
-    def run_with_gpu(image: np.ndarray, resolution_level: int, apply_mask: bool, refine_steps: int) -> Dict[str, np.ndarray]:
-        image_tensor = torch.tensor(image, dtype=torch.float32, device=torch.device('cuda')).permute(2, 0, 1) / 255
+    def run_inference(image: np.ndarray, resolution_level: int, apply_mask: bool, refine_steps: int) -> Dict[str, np.ndarray]:
+        image_tensor = torch.tensor(image, dtype=torch.float32, device=device).permute(2, 0, 1) / 255
         infer_kwargs = {
             'apply_mask': apply_mask,
             'resolution_level': resolution_level,
-            'use_fp16': use_fp16,
+            'use_fp16': use_fp16 and device.type == 'cuda',
         }
         if model_version == 'v3':
             infer_kwargs['refine_steps'] = refine_steps
@@ -103,7 +109,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         height, width = image.shape[:2]
 
         resolution_level_int = {'Low': 0, 'Medium': 5, 'High': 9, 'Ultra': 30}.get(resolution_level, 9)
-        output = run_with_gpu(image, resolution_level_int, apply_mask, refine_steps)
+        output = run_inference(image, resolution_level_int, apply_mask, refine_steps)
 
         points, depth, mask = output['points'], output['depth'], output['mask']
         normal = output.get('normal')

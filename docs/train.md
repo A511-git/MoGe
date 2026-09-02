@@ -56,7 +56,7 @@ Our training dataloaders is customized to handle loading data, performing perspe
 
 ## Configuration
 
-See [`configs/train/v1.json`](../configs/train/v1.json) for an example configuration file. The configuration file defines the hyperparameters for training the MoGe model. 
+See [`configs/train/v3.json`](../configs/train/v3.json) for the current MoGe-3 configuration file, or [`configs/train/v2.json`](../configs/train/v2.json) and [`configs/train/v1.json`](../configs/train/v1.json) for earlier versions. The configuration file defines the hyperparameters for training the MoGe model. 
 Here is a commented configuration for reference:
 
 ```json
