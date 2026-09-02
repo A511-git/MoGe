@@ -551,91 +551,69 @@ def build_panorama_mesh_equirectangular(
     panorama_depth: np.ndarray,
     panorama_mask: np.ndarray,
     panorama_normal: Optional[np.ndarray] = None,
-    threshold: float = 0.04,
+    threshold: float = 0.03,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Builds a continuous, seamless 360-degree room mesh from an equirectangular depth map.
-    Handles 360-degree horizontal wrapping and filters depth edge jumps.
+    Handles 360-degree horizontal wrapping and filters depth edge jumps using utils3d.
     Returns (vertices, faces, vertex_colors, vertex_uvs, vertex_normals).
     """
     H, W = panorama_depth.shape[:2]
-    uv = utils3d.np.uv_map((H, W))
+    uv = utils3d.np.uv_map(H, W)
     spherical_dirs = spherical_uv_to_directions(uv)
     points = panorama_depth[..., None] * spherical_dirs
 
-    # Clean mask: must have positive depth and be valid
-    valid = panorama_mask & (panorama_depth > 0.01)
+    # Valid mask
+    valid_mask = panorama_mask & (panorama_depth > 0.01)
 
-    # Filter depth edges horizontally and vertically
-    padded_depth = np.pad(panorama_depth, ((0, 0), (0, 1)), mode='wrap')
-    p_min = np.maximum(np.minimum(padded_depth[:, :-1], padded_depth[:, 1:]), 1e-3)
-    edge_x = (np.abs(padded_depth[:, :-1] - padded_depth[:, 1:]) / p_min) > threshold
-
-    p_y_min = np.maximum(np.minimum(panorama_depth[:-1, :], panorama_depth[1:, :]), 1e-3)
-    edge_y_core = (np.abs(panorama_depth[:-1, :] - panorama_depth[1:, :]) / p_y_min) > threshold
-    edge_y = np.pad(edge_y_core, ((0, 1), (0, 0)), mode='edge')
-
-    # Duplicate column 0 as column W to wrap horizontally with continuous UV coordinates:
-    pts_wrapped = np.concatenate([points, points[:, :1]], axis=1) # (H, W + 1, 3)
-    u_coords = np.linspace(0.0, 1.0, W + 1, dtype=np.float32)
-    v_coords = np.linspace(0.0, 1.0, H, dtype=np.float32)
-    uu, vv = np.meshgrid(u_coords, v_coords)
-    uvs_wrapped = np.stack([uu, vv], axis=-1) # (H, W + 1, 2)
-
-    img_float = image.astype(np.float32) / 255.0
-    colors_wrapped = np.concatenate([img_float, img_float[:, :1]], axis=1) # (H, W + 1, 3)
-
-    if panorama_normal is not None:
-        norm_wrapped = np.concatenate([panorama_normal, panorama_normal[:, :1]], axis=1)
+    # Edge filtering: prune depth jumps across silhouettes
+    if threshold is not None and threshold > 0 and not np.isinf(threshold):
+        depth_edge = utils3d.np.depth_map_edge(panorama_depth, rtol=threshold, mask=valid_mask)
+        if panorama_normal is not None:
+            norm_edge = utils3d.np.normal_map_edge(panorama_normal, tol=10, mask=valid_mask)
+            clean_mask = valid_mask & ~(depth_edge & norm_edge)
+        else:
+            clean_mask = valid_mask & ~depth_edge
     else:
-        norm_wrapped = None
+        clean_mask = valid_mask
 
-    valid_wrapped = np.concatenate([valid, valid[:, :1]], axis=1)
+    # Wrap column 0 to column W for continuous 360-degree closure without seams
+    points_w = np.concatenate([points, points[:, :1]], axis=1)
+    img_w = np.concatenate([image, image[:, :1]], axis=1)
+    mask_w = np.concatenate([clean_mask, clean_mask[:, :1]], axis=1)
 
-    # Flatten arrays
-    W_ext = W + 1
-    total_verts = H * W_ext
-    vert_indices = np.arange(total_verts).reshape(H, W_ext)
+    u = np.linspace(0.0, 1.0, W + 1, dtype=np.float32)
+    v = np.linspace(0.0, 1.0, H, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    uv_w = np.stack([uu, vv], axis=-1)
 
-    # Quad corners:
-    tl = vert_indices[:-1, :-1]
-    tr = vert_indices[:-1, 1:]
-    bl = vert_indices[1:, :-1]
-    br = vert_indices[1:, 1:]
+    has_normals = panorama_normal is not None
+    if has_normals:
+        norm_w = np.concatenate([panorama_normal, panorama_normal[:, :1]], axis=1)
+        faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.np.build_mesh_from_map(
+            points_w,
+            img_w.astype(np.float32) / 255.0,
+            uv_w,
+            norm_w,
+            mask=mask_w,
+            tri=True
+        )
+    else:
+        faces, vertices, vertex_colors, vertex_uvs = utils3d.np.build_mesh_from_map(
+            points_w,
+            img_w.astype(np.float32) / 255.0,
+            uv_w,
+            mask=mask_w,
+            tri=True
+        )
+        vertex_normals = None
 
-    v_tl = valid_wrapped[:-1, :-1]
-    v_tr = valid_wrapped[:-1, 1:]
-    v_bl = valid_wrapped[1:, :-1]
-    v_br = valid_wrapped[1:, 1:]
-
-    e_x_top = edge_x[:-1, :]
-    e_x_bot = edge_x[1:, :]
-    e_y_left = edge_y[:-1, :]
-    e_y_right = np.roll(edge_y[:-1, :], -1, axis=1)
-
-    # Triangle 1: (TL, BL, TR)
-    tri1_valid = v_tl & v_bl & v_tr & ~e_x_top & ~e_y_left
-    # Triangle 2: (TR, BL, BR)
-    tri2_valid = v_tr & v_bl & v_br & ~e_x_bot & ~e_y_right
-
-    f1 = np.stack([tl[tri1_valid], bl[tri1_valid], tr[tri1_valid]], axis=-1)
-    f2 = np.stack([tr[tri2_valid], bl[tri2_valid], br[tri2_valid]], axis=-1)
-    faces = np.concatenate([f1, f2], axis=0)
-
-    if len(faces) == 0:
+    if len(vertices) == 0 or len(faces) == 0:
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), np.zeros((0, 2)), None
 
-    # Compact unreferenced vertices
-    used_indices, inverse_indices = np.unique(faces, return_inverse=True)
-    faces = inverse_indices.reshape(faces.shape).astype(np.int32)
-    vertices = vertices[used_indices]
-    vertex_colors = vertex_colors[used_indices]
-    vertex_uvs = vertex_uvs[used_indices]
-    if vertex_normals is not None:
-        vertex_normals = vertex_normals[used_indices]
-
-    # Follow OpenGL conventions: x right, y up, z backward
-    # Texture coordinate system: (0, 0) for left-bottom, (1, 1) for right-top
+    # OpenGL coordinate conventions:
+    # - world coordinate system: x right, y up, z backward.
+    # - texture coordinate system: (0, 0) for left-bottom, (1, 1) for right-top.
     vertices = vertices * [1, -1, -1]
     vertex_uvs = vertex_uvs * [1, -1] + [0, 1]
     if vertex_normals is not None:

@@ -341,8 +341,9 @@ def main(
 
         if (save_glb_ or save_ply_ or show) and len(vertices) > 0:
             if save_glb_:
+                glb_file = save_path / 'mesh.glb'
                 save_glb(
-                    save_path / 'mesh.glb',
+                    glb_file,
                     vertices,
                     faces,
                     vertex_uvs=vertex_uvs,
@@ -350,9 +351,24 @@ def main(
                     vertex_colors=vertex_colors,
                     vertex_normals=vertex_normals
                 )
+                print(f'Saved 3D mesh: {glb_file} ({len(vertices)} vertices, {len(faces)} faces)')
+                if len(image_paths) == 1 and Path(output_path).resolve() != save_path.resolve():
+                    import shutil
+                    try:
+                        shutil.copy2(glb_file, Path(output_path) / 'mesh.glb')
+                    except Exception:
+                        pass
 
             if save_ply_:
-                save_ply(save_path / 'mesh.ply', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
+                ply_file = save_path / 'mesh.ply'
+                save_ply(ply_file, vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
+                print(f'Saved 3D mesh: {ply_file}')
+                if len(image_paths) == 1 and Path(output_path).resolve() != save_path.resolve():
+                    import shutil
+                    try:
+                        shutil.copy2(ply_file, Path(output_path) / 'mesh.ply')
+                    except Exception:
+                        pass
 
             if show:
                 trimesh.Trimesh(
