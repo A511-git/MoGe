@@ -27,7 +27,8 @@ import click
 @click.option('--threshold', type=float, default=0.03, help='Threshold for removing edges. Defaults to 0.03. Smaller value removes more edges. "inf" means no thresholding.')
 @click.option('--batch_size', type=int, default=4, help='Batch size for inference. Defaults to 4.')
 @click.option('--merge_method', type=click.Choice(['raycast', 'poisson']), default='raycast', help='Method for merging panorama 2D maps: "raycast" (default, fast, metric-accurate) or "poisson" (legacy gradient integration).')
-@click.option('--planar_floor/--no_planar_floor', 'planar_floor', default=True, help='Fit a planar ground floor and snap floor points to prevent ground splatter. Defaults to True.')
+@click.option('--mesh_type', type=click.Choice(['equirectangular', 'multiview']), default='equirectangular', help='3D mesh method: "equirectangular" (default, continuous airtight 360 room mesh with texture) or "multiview" (multi-view perspective meshes).')
+@click.option('--align_scales/--no_align_scales', 'align_scales', default=True, help='Normalize scale across all 12 views using the ground plane to eliminate inter-view floating steps. Defaults to True.')
 @click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted perspective views and all associated data (RGB, depth, distance, points, mask, normal, cameras). Defaults to False.')
 @click.option('--use_cache', is_flag=True, help='Use cached splitted views from <output>/splitted to skip neural inference and continue directly with 2D merging and 3D mesh building.')
 @click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, normal, fov).')
@@ -50,6 +51,8 @@ def main(
     batch_size: int,
     merge_method: str,
     planar_floor: bool,
+    mesh_type: str,
+    align_scales: bool,
     save_splitted: bool,
     use_cache: bool,
     save_maps_: bool,
@@ -84,7 +87,9 @@ def main(
         merge_panorama_depth,
         merge_panorama_depth_raycast,
         build_panorama_mesh_multiview,
-        fit_ground_plane
+        build_panorama_mesh_equirectangular,
+        fit_ground_plane,
+        align_view_scales
     )
 
     
@@ -253,6 +258,17 @@ def main(
                 with open(splitted_save_path / 'cameras.json', 'w') as f:
                     json.dump({'views': cameras_meta}, f, indent=2)
 
+        # Align scale across views using ground plane consensus
+        if align_scales and len(splitted_normal_maps) > 0:
+            splitted_points_maps, splitted_depth_maps, splitted_distance_maps = align_view_scales(
+                splitted_points_maps,
+                splitted_depth_maps,
+                splitted_distance_maps,
+                splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
+                splitted_masks,
+                splitted_extrinsics
+            )
+
         # Fit ground plane if planar_floor is enabled
         ground_plane = None
         if planar_floor and len(splitted_normal_maps) > 0:
@@ -261,21 +277,6 @@ def main(
                 splitted_normal_maps,
                 splitted_masks,
                 splitted_extrinsics
-            )
-
-        # Build 3D mesh directly in world space
-        vertices, faces, vertex_colors, vertex_normals = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None
-        if save_glb_ or save_ply_ or show:
-            print('Building 3D multi-view mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 3D mesh')
-            vertices, faces, vertex_colors, vertex_normals, _ = build_panorama_mesh_multiview(
-                splitted_images,
-                splitted_points_maps,
-                splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
-                splitted_masks,
-                splitted_extrinsics,
-                threshold=threshold,
-                planar_floor=planar_floor,
-                ground_plane=ground_plane
             )
 
         # Merge 2D maps
@@ -311,9 +312,43 @@ def main(
             cv2.imwrite(str(save_path / 'points.exr'), cv2.cvtColor(points, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
             cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
 
+        # Build 3D mesh
+        vertices, faces, vertex_colors, vertex_uvs, vertex_normals = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3)), None, None
+        if save_glb_ or save_ply_ or show:
+            if mesh_type == 'equirectangular':
+                print('Building continuous 360 mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 360 mesh')
+                vertices, faces, vertex_colors, vertex_uvs, vertex_normals = build_panorama_mesh_equirectangular(
+                    image,
+                    panorama_depth,
+                    panorama_mask,
+                    panorama_normal=panorama_normal,
+                    threshold=threshold
+                )
+            else:
+                print('Building 3D multi-view mesh...') if pbar.disable else pbar.set_postfix_str(f'Building 3D mesh')
+                vertices, faces, vertex_colors, vertex_normals, _ = build_panorama_mesh_multiview(
+                    splitted_images,
+                    splitted_points_maps,
+                    splitted_normal_maps if len(splitted_normal_maps) > 0 else None,
+                    splitted_masks,
+                    splitted_extrinsics,
+                    threshold=threshold,
+                    planar_floor=planar_floor,
+                    ground_plane=ground_plane
+                )
+                vertex_uvs = None
+
         if (save_glb_ or save_ply_ or show) and len(vertices) > 0:
             if save_glb_:
-                save_glb(save_path / 'mesh.glb', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
+                save_glb(
+                    save_path / 'mesh.glb',
+                    vertices,
+                    faces,
+                    vertex_uvs=vertex_uvs,
+                    texture=image if vertex_uvs is not None else None,
+                    vertex_colors=vertex_colors,
+                    vertex_normals=vertex_normals
+                )
 
             if save_ply_:
                 save_ply(save_path / 'mesh.ply', vertices, faces, vertex_colors=vertex_colors, vertex_normals=vertex_normals)
