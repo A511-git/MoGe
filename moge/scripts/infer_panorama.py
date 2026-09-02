@@ -21,7 +21,7 @@ import click
 @click.option('--resolution_level', type=int, default=9, help='An integer [0-9] for the resolution level of inference. The higher, the better but slower. Defaults to 9. Note that it is irrelevant to the output resolution.')
 @click.option('--threshold', type=float, default=0.03, help='Threshold for removing edges. Defaults to 0.03. Smaller value removes more edges. "inf" means no thresholding.')
 @click.option('--batch_size', type=int, default=4, help='Batch size for inference. Defaults to 4.')
-@click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted images. Defaults to False.')
+@click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted perspective views and all associated data (RGB, depth, distance, points, mask, normal, cameras). Defaults to False.')
 @click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, fov).')
 @click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a.glb file. The color will be saved as a texture.')
 @click.option('--ply', 'save_ply_', is_flag=True, help='Whether to save the output as a.ply file. The color will be saved as vertex colors.')
@@ -60,7 +60,7 @@ def main(
         import utils3d
     from moge.model.v1 import MoGeModel
     from moge.utils.io import save_glb, save_ply
-    from moge.utils.vis import colorize_depth
+    from moge.utils.vis import colorize_depth, colorize_normal
     from moge.utils.panorama import spherical_uv_to_directions, get_panorama_cameras, split_panorama_image, merge_panorama_depth
 
     
@@ -89,6 +89,9 @@ def main(
             height, width = min(resize_to, int(resize_to * height / width)), min(resize_to, int(resize_to * width / height))
             image = cv2.resize(image, (width, height), cv2.INTER_AREA)
         
+        save_path = Path(output_path, image_path.relative_to(input_path).parent, image_path.stem)
+        save_path.mkdir(exist_ok=True, parents=True)
+
         splitted_extrinsics, splitted_intriniscs = get_panorama_cameras()
         splitted_resolution = 512
         splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intriniscs, splitted_resolution)
@@ -97,6 +100,9 @@ def main(
         print('Inferring...') if pbar.disable else pbar.set_postfix_str(f'Inferring')
 
         splitted_distance_maps, splitted_masks = [], []
+        if save_splitted:
+            splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
+
         for i in trange(0, len(splitted_images), batch_size, desc='Inferring splitted views', disable=len(splitted_images) <= batch_size, leave=False):
             image_tensor = torch.tensor(np.stack(splitted_images[i:i + batch_size]) / 255, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
             fov_x, fov_y = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intriniscs[i:i + batch_size])))
@@ -106,13 +112,50 @@ def main(
             splitted_distance_maps.extend(list(distance_map))
             splitted_masks.extend(list(mask))
 
+            if save_splitted:
+                splitted_depth_maps.extend(list(output['depth'].cpu().numpy()))
+                splitted_points_maps.extend(list(output['points'].cpu().numpy()))
+                if 'normal' in output and output['normal'] is not None:
+                    splitted_normal_maps.extend(list(output['normal'].cpu().numpy()))
+
         # Save splitted
         if save_splitted:
-            splitted_save_path = Path(output_path, image_path.stem, 'splitted')
+            splitted_save_path = save_path / 'splitted'
             splitted_save_path.mkdir(exist_ok=True, parents=True)
+            cameras_meta = []
             for i in range(len(splitted_images)):
+                # RGB image
                 cv2.imwrite(str(splitted_save_path / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
+                # Validity mask
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
+                # Depth (raw float32 and visualization)
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                # Distance (raw float32 and visualization)
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
                 cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                # Point map
+                cv2.imwrite(str(splitted_save_path / f'{i:02d}_points.exr'), splitted_points_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                # Normal (if available)
+                if len(splitted_normal_maps) > i:
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+
+                # Camera parameters
+                fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intriniscs[i]))
+                cam_info = {
+                    'index': i,
+                    'image': f'{i:02d}.jpg',
+                    'fov_x': round(float(fov_xi), 2),
+                    'fov_y': round(float(fov_yi), 2),
+                    'intrinsics': splitted_intriniscs[i].tolist(),
+                    'extrinsics': splitted_extrinsics[i].tolist(),
+                }
+                cameras_meta.append(cam_info)
+                with open(splitted_save_path / f'{i:02d}_camera.json', 'w') as f:
+                    json.dump(cam_info, f, indent=2)
+
+            with open(splitted_save_path / 'cameras.json', 'w') as f:
+                json.dump({'views': cameras_meta}, f, indent=2)
 
         # Merge
         print('Merging...') if pbar.disable else pbar.set_postfix_str(f'Merging')
@@ -125,9 +168,7 @@ def main(
         points = panorama_depth[:, :, None] * spherical_uv_to_directions(utils3d.np.uv_map(height, width))
         
         # Write outputs
-        print('Writing outputs...') if pbar.disable else pbar.set_postfix_str(f'Inferring')
-        save_path = Path(output_path, image_path.relative_to(input_path).parent, image_path.stem)
-        save_path.mkdir(exist_ok=True, parents=True)
+        print('Writing outputs...') if pbar.disable else pbar.set_postfix_str(f'Writing outputs')
         if save_maps_:
             cv2.imwrite(str(save_path / 'image.jpg'), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
