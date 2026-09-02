@@ -29,6 +29,7 @@ import click
 @click.option('--merge_method', type=click.Choice(['raycast', 'poisson']), default='raycast', help='Method for merging panorama 2D maps: "raycast" (default, fast, metric-accurate) or "poisson" (legacy gradient integration).')
 @click.option('--planar_floor/--no_planar_floor', 'planar_floor', default=True, help='Fit a planar ground floor and snap floor points to prevent ground splatter. Defaults to True.')
 @click.option('--splitted', 'save_splitted', is_flag=True, help='Whether to save the splitted perspective views and all associated data (RGB, depth, distance, points, mask, normal, cameras). Defaults to False.')
+@click.option('--use_cache', is_flag=True, help='Use cached splitted views from <output>/splitted to skip neural inference and continue directly with 2D merging and 3D mesh building.')
 @click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps and fov(image, depth, mask, points, normal, fov).')
 @click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a .glb file. The color will be saved as a texture.')
 @click.option('--ply', 'save_ply_', is_flag=True, help='Whether to save the output as a .ply file. The color will be saved as vertex colors.')
@@ -50,6 +51,7 @@ def main(
     merge_method: str,
     planar_floor: bool,
     save_splitted: bool,
+    use_cache: bool,
     save_maps_: bool,
     save_glb_: bool,
     save_ply_: bool,
@@ -81,7 +83,8 @@ def main(
         split_panorama_image, 
         merge_panorama_depth,
         merge_panorama_depth_raycast,
-        build_panorama_mesh_multiview
+        build_panorama_mesh_multiview,
+        fit_ground_plane
     )
 
     
@@ -109,9 +112,14 @@ def main(
         }
         pretrained_model_name_or_path = default_pretrained_models[model_version]
 
-    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
-    if use_fp16 and model_version != 'v3':
-        model.half()
+    model = None
+    def load_model():
+        nonlocal model
+        if model is None:
+            model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
+            if use_fp16 and model_version != 'v3':
+                model.half()
+        return model
 
     for image_path in (pbar := tqdm(image_paths, desc='Total images', disable=len(image_paths) <= 1)):
         image = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
@@ -126,75 +134,124 @@ def main(
         splitted_extrinsics, splitted_intriniscs = get_panorama_cameras()
         splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intriniscs, split_resolution)
 
-        # Infer each view 
-        print('Inferring...') if pbar.disable else pbar.set_postfix_str(f'Inferring')
+        splitted_save_path = save_path / 'splitted'
+        has_cache = use_cache and splitted_save_path.exists() and (splitted_save_path / '00.jpg').exists() and (splitted_save_path / '00_points.exr').exists()
 
-        splitted_distance_maps, splitted_masks = [], []
-        splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
+        if has_cache:
+            print('Loading cached splitted views from disk...') if pbar.disable else pbar.set_postfix_str('Loading cache')
+            splitted_images = []
+            splitted_distance_maps, splitted_masks = [], []
+            splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
 
-        for i in trange(0, len(splitted_images), batch_size, desc='Inferring splitted views', disable=len(splitted_images) <= batch_size, leave=False):
-            image_tensor = torch.tensor(np.stack(splitted_images[i:i + batch_size]) / 255, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
-            fov_x, fov_y = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intriniscs[i:i + batch_size])))
-            fov_x = torch.tensor(fov_x, dtype=torch.float32, device=device)
+            for i in range(len(splitted_extrinsics)):
+                img_file = splitted_save_path / f'{i:02d}.jpg'
+                mask_file = splitted_save_path / f'{i:02d}_mask.png'
+                depth_file = splitted_save_path / f'{i:02d}_depth.exr'
+                dist_file = splitted_save_path / f'{i:02d}_distance.exr'
+                pts_file = splitted_save_path / f'{i:02d}_points.exr'
+                norm_exr = splitted_save_path / f'{i:02d}_normal.exr'
 
-            infer_kwargs = {
-                'fov_x': fov_x,
-                'resolution_level': resolution_level,
-                'use_fp16': use_fp16,
-                'apply_mask': False,
-            }
-            if num_tokens is not None:
-                infer_kwargs['num_tokens'] = num_tokens
-            if model_version == 'v3':
-                infer_kwargs['refine_steps'] = refine_steps
+                img_bgr = cv2.imread(str(img_file))
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                splitted_images.append(img_rgb)
 
-            output = model.infer(image_tensor, **infer_kwargs)
-            distance_map, mask = output['points'].norm(dim=-1).cpu().numpy(), output['mask'].cpu().numpy()
-            splitted_distance_maps.extend(list(distance_map))
-            splitted_masks.extend(list(mask))
-            splitted_depth_maps.extend(list(output['depth'].cpu().numpy()))
-            splitted_points_maps.extend(list(output['points'].cpu().numpy()))
-            if 'normal' in output and output['normal'] is not None:
-                splitted_normal_maps.extend(list(output['normal'].cpu().numpy()))
+                mask = (cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE) > 127)
+                splitted_masks.append(mask)
 
-        # Save splitted
-        if save_splitted:
-            splitted_save_path = save_path / 'splitted'
-            splitted_save_path.mkdir(exist_ok=True, parents=True)
-            cameras_meta = []
-            for i in range(len(splitted_images)):
-                # RGB image
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
-                # Validity mask
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
-                # Depth (raw float32 and visualization)
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                # Distance (raw float32 and visualization)
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                # Point map (swapped to BGR for OpenCV EXR writer)
-                cv2.imwrite(str(splitted_save_path / f'{i:02d}_points.exr'), cv2.cvtColor(splitted_points_maps[i], cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                # Normal (if available)
-                if len(splitted_normal_maps) > i:
-                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                depth = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED)
+                splitted_depth_maps.append(depth)
 
-                # Camera parameters
-                fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intriniscs[i]))
-                cam_info = {
-                    'index': i,
-                    'image': f'{i:02d}.jpg',
-                    'fov_x': round(float(fov_xi), 2),
-                    'fov_y': round(float(fov_yi), 2),
-                    'intrinsics': splitted_intriniscs[i].tolist(),
-                    'extrinsics': splitted_extrinsics[i].tolist(),
+                if dist_file.exists():
+                    dist = cv2.imread(str(dist_file), cv2.IMREAD_UNCHANGED)
+                else:
+                    dist = depth
+                splitted_distance_maps.append(dist)
+
+                pts_raw = cv2.imread(str(pts_file), cv2.IMREAD_UNCHANGED)
+                if pts_raw is not None and pts_raw.ndim == 3 and pts_raw.shape[-1] >= 3:
+                    pts = cv2.cvtColor(pts_raw[..., :3], cv2.COLOR_BGR2RGB)
+                else:
+                    pts = pts_raw
+                splitted_points_maps.append(pts)
+
+                if norm_exr.exists():
+                    norm_raw = cv2.imread(str(norm_exr), cv2.IMREAD_UNCHANGED)
+                    norm = cv2.cvtColor(norm_raw[..., :3], cv2.COLOR_BGR2RGB)
+                    splitted_normal_maps.append(norm)
+                elif pts is not None:
+                    norm, _ = utils3d.np.point_map_to_normal_map(pts, mask=mask)
+                    splitted_normal_maps.append(norm)
+        else:
+            # Infer each view 
+            print('Inferring...') if pbar.disable else pbar.set_postfix_str(f'Inferring')
+            model_instance = load_model()
+
+            splitted_distance_maps, splitted_masks = [], []
+            splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
+
+            for i in trange(0, len(splitted_images), batch_size, desc='Inferring splitted views', disable=len(splitted_images) <= batch_size, leave=False):
+                image_tensor = torch.tensor(np.stack(splitted_images[i:i + batch_size]) / 255, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
+                fov_x, fov_y = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intriniscs[i:i + batch_size])))
+                fov_x = torch.tensor(fov_x, dtype=torch.float32, device=device)
+
+                infer_kwargs = {
+                    'fov_x': fov_x,
+                    'resolution_level': resolution_level,
+                    'use_fp16': use_fp16,
+                    'apply_mask': False,
                 }
-                cameras_meta.append(cam_info)
-                with open(splitted_save_path / f'{i:02d}_camera.json', 'w') as f:
-                    json.dump(cam_info, f, indent=2)
+                if num_tokens is not None:
+                    infer_kwargs['num_tokens'] = num_tokens
+                if model_version == 'v3':
+                    infer_kwargs['refine_steps'] = refine_steps
 
-            with open(splitted_save_path / 'cameras.json', 'w') as f:
-                json.dump({'views': cameras_meta}, f, indent=2)
+                output = model_instance.infer(image_tensor, **infer_kwargs)
+                distance_map, mask = output['points'].norm(dim=-1).cpu().numpy(), output['mask'].cpu().numpy()
+                splitted_distance_maps.extend(list(distance_map))
+                splitted_masks.extend(list(mask))
+                splitted_depth_maps.extend(list(output['depth'].cpu().numpy()))
+                splitted_points_maps.extend(list(output['points'].cpu().numpy()))
+                if 'normal' in output and output['normal'] is not None:
+                    splitted_normal_maps.extend(list(output['normal'].cpu().numpy()))
+
+            # Save splitted
+            if save_splitted:
+                splitted_save_path.mkdir(exist_ok=True, parents=True)
+                cameras_meta = []
+                for i in range(len(splitted_images)):
+                    # RGB image
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
+                    # Validity mask
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
+                    # Depth (raw float32 and visualization)
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                    # Distance (raw float32 and visualization)
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                    # Point map (swapped to BGR for OpenCV EXR writer)
+                    cv2.imwrite(str(splitted_save_path / f'{i:02d}_points.exr'), cv2.cvtColor(splitted_points_maps[i], cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    # Normal (if available)
+                    if len(splitted_normal_maps) > i and splitted_normal_maps[i] is not None:
+                        cv2.imwrite(str(splitted_save_path / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                        cv2.imwrite(str(splitted_save_path / f'{i:02d}_normal.exr'), cv2.cvtColor(splitted_normal_maps[i], cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                    # Camera parameters
+                    fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intriniscs[i]))
+                    cam_info = {
+                        'index': i,
+                        'image': f'{i:02d}.jpg',
+                        'fov_x': round(float(fov_xi), 2),
+                        'fov_y': round(float(fov_yi), 2),
+                        'intrinsics': splitted_intriniscs[i].tolist(),
+                        'extrinsics': splitted_extrinsics[i].tolist(),
+                    }
+                    cameras_meta.append(cam_info)
+                    with open(splitted_save_path / f'{i:02d}_camera.json', 'w') as f:
+                        json.dump(cam_info, f, indent=2)
+
+                with open(splitted_save_path / 'cameras.json', 'w') as f:
+                    json.dump({'views': cameras_meta}, f, indent=2)
 
         # Fit ground plane if planar_floor is enabled
         ground_plane = None

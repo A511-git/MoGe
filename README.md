@@ -337,6 +337,7 @@ moge infer_panorama -i PANORAMA_IMAGE_OR_FOLDER --version v2 --splitted -o OUTPU
 | **`--fp16`** | Flag | `False` | Uses FP16 mixed precision.<br>• **Enabled**: Cuts GPU memory footprint in half and roughly doubles speed on modern NVIDIA GPUs. |
 | **`--device`** | `str` | `cuda` | Computing device (e.g., `cuda`, `cuda:0`, or `cpu`). |
 | **`--splitted`** | Flag | `False` | Saves all 12 individual perspective crops and their full metadata (`.jpg`, `.exr` depth/distance/points, `.png` mask/normal, `{i:02d}_camera.json`, and multi-view `cameras.json`). |
+| **`--use_cache`** | Flag | `False` | Reuses previously saved perspective views from `<output>/splitted` to completely skip neural network inference and immediately continue with 2D merging and 3D mesh building. |
 | **`--maps`** | Flag | `True`* | Saves 2D map outputs: `image.jpg`, `depth.exr`, `depth_vis.png`, `normal_vis.png`, `points.exr`, and `mask.png`. |
 | **`--glb`** | Flag | `True`* | Exports textured 3D mesh as a `.glb` file. |
 | **`--ply`** | Flag | `True`* | Exports 3D point cloud / mesh as a `.ply` file with vertex colors. |
