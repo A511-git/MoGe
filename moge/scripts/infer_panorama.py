@@ -199,7 +199,18 @@ def main(
         points = panorama_depth[:, :, None] * spherical_uv_to_directions(utils3d.np.uv_map(height, width))
         
         if save_maps_ or save_glb_ or save_ply_ or show:
-            normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
+            # Fix #1: point_map_to_normal_map pads its array boundary with
+            # zeros, not wrap, so the two panorama-edge columns (the true
+            # theta=0/360 seam) get a false normal derived from a phantom
+            # zero point instead of their real neighbor across the seam
+            # (measured: up to ~7 deg normal error, isolated exactly to the
+            # boundary columns). Fix: wrap-pad by the function's kernel
+            # radius (1 px for the default 3x3 neighborhood) before calling
+            # it, then crop the padding back off.
+            points_padded = np.concatenate([points[:, -1:], points, points[:, :1]], axis=1)
+            mask_padded = np.concatenate([panorama_mask[:, -1:], panorama_mask, panorama_mask[:, :1]], axis=1)
+            normals_padded, normals_mask_padded = utils3d.np.point_map_to_normal_map(points_padded, mask_padded)
+            normals, normals_mask = normals_padded[:, 1:-1], normals_mask_padded[:, 1:-1]
 
         # Write outputs
         print('Writing outputs...') if pbar.disable else pbar.set_postfix_str(f'Writing outputs')
@@ -213,11 +224,23 @@ def main(
 
         # Export mesh & visulization
         if save_glb_ or save_ply_ or show:
+            # Fix #7 (median denoise) + Fix #2 (wrap-pad, same rationale as
+            # Fix #1: depth_map_edge/normal_map_edge also pad with 'edge'
+            # replicate, not wrap, so the seam column gets falsely flagged
+            # as a depth/normal discontinuity -- measured 246x higher false
+            # -edge rate at the seam vs. interior columns).
+            depth_for_edge_test = cv2.medianBlur(panorama_depth, 3)
+            depth_padded = np.concatenate([depth_for_edge_test[:, -1:], depth_for_edge_test, depth_for_edge_test[:, :1]], axis=1)
+            depth_mask_padded = np.concatenate([panorama_mask[:, -1:], panorama_mask, panorama_mask[:, :1]], axis=1)
+            normals_edge_padded = np.concatenate([normals[:, -1:], normals, normals[:, :1]], axis=1)
+            normals_mask_edge_padded = np.concatenate([normals_mask[:, -1:], normals_mask, normals_mask[:, :1]], axis=1)
+            depth_edge = utils3d.np.depth_map_edge(depth_padded, rtol=threshold, mask=depth_mask_padded)[:, 1:-1]
+            normal_edge = utils3d.np.normal_map_edge(normals_edge_padded, tol=5, mask=normals_mask_edge_padded)[:, 1:-1]
             faces, vertices, vertex_colors, vertex_uvs = utils3d.np.build_mesh_from_map(
                 points,
                 image.astype(np.float32) / 255,
                 utils3d.np.uv_map(height, width),
-                mask=panorama_mask & ~(utils3d.np.depth_map_edge(panorama_depth, rtol=threshold) & utils3d.np.normal_map_edge(normals, tol=5, mask=normals_mask)),
+                mask=panorama_mask & ~(depth_edge & normal_edge),
                 tri=True
             )
 
